@@ -175,7 +175,7 @@ async function searchOpinions(query: string, court?: string, dateAfter?: string)
   if (court) params.set('court', court);
   if (dateAfter) params.set('filed_after', dateAfter);
 
-  const res = await fetch(`https://www.courtlistener.com/api/rest/v3/search/?${params}`, {
+  const res = await fetch(`${BASE}/search/?${params}`, {
     headers: { Accept: 'application/json' },
   });
   if (!res.ok) throw new Error(`CourtListener API error: ${res.status}`);
@@ -198,7 +198,7 @@ async function searchDockets(query: string, court?: string) {
   });
   if (court) params.set('court', court);
 
-  const res = await fetch(`https://www.courtlistener.com/api/rest/v3/search/?${params}`, {
+  const res = await fetch(`${BASE}/search/?${params}`, {
     headers: { Accept: 'application/json' },
   });
   if (!res.ok) throw new Error(`CourtListener API error: ${res.status}`);

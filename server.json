@@ -3,7 +3,7 @@
   "name": "io.github.pipeworx-io/court-listener",
   "title": "Court Listener",
   "description": "CourtListener MCP — Free Law Project's CourtListener API (free, no auth required for basic access)",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "websiteUrl": "https://pipeworx.io/packs/court-listener",
   "repository": {
     "url": "https://github.com/pipeworx-io/mcp-court-listener",
