@@ -4,7 +4,7 @@ US court opinions from Free Law Project's CourtListener: **8.3 million opinions
 across 3,361 courts**, going back to 1761. The largest free, structured database
 of American case law.
 
-Part of [Pipeworx](https://pipeworx.io) — an MCP gateway connecting AI agents to 1679+ live data sources.
+Part of [Pipeworx](https://pipeworx.io) — an MCP gateway connecting AI agents to 1683+ live data sources.
 
 Most of it is **state** law. That surprises people, and it is the point:
 
@@ -172,7 +172,7 @@ directly, instead of just this one's:
 }
 ```
 
-Both URLs reach the same gateway and the same 1679+ data sources. The
+Both URLs reach the same gateway and the same 1683+ data sources. The
 only difference is which pack's tools are listed **directly**; `ask_pipeworx`
 reaches all of them from either one.
 
