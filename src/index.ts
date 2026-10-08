@@ -1527,6 +1527,12 @@ async function searchOpinions(m: Mirror, a: SearchOpinionsArgs) {
   const params = new URLSearchParams({ q: a.query, type: 'o', order_by: 'score desc' });
   if (a.court) params.set('court', a.court);
   if (a.dateAfter) params.set('filed_after', a.dateAfter);
+  // date_before used to be dropped here, so a bounded window ("Q3 only")
+  // came back with every filing since date_after, up to today, as if the
+  // bound had been honoured (fleet #2835). Same YYYY-MM-DD form as
+  // filed_after; verified against v4 2026-10-08: negligence 2026-07-01..07-10
+  // = 173 hits, unbounded = 1,402 reaching 2026-10-07.
+  if (a.dateBefore) params.set('filed_before', a.dateBefore);
 
   const { rows, total, truncated } = await searchPaged(params, a.limit);
   const cases: UnifiedCase[] = rows.map(liveCase);
