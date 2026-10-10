@@ -1,6 +1,6 @@
 {
   "name": "@pipeworx/mcp-court-listener",
-  "version": "0.1.4",
+  "version": "0.1.5",
   "description": "CourtListener MCP — Free Law Project's CourtListener API (v4).",
   "type": "module",
   "main": "src/index.ts",
@@ -26,7 +26,7 @@
     "@cloudflare/workers-types": "^4.20260405.1"
   },
   "pipeworx": {
-    "sourceHash": "v1-ed77b8611b73db0a326a3d2249f11164585c2eec44cc0ea358d4f7998335d864",
-    "sourceCommit": "e369dfedd93d5fcbf521281559a146302c14e1a0"
+    "sourceHash": "v1-bd16dd81451451e43ed54b0c6dab513b8c4b2e7572f3caaa50618d51593ef925",
+    "sourceCommit": "1f9b4f362b4a15045caeef1caed5dc906f85b9d1"
   }
 }

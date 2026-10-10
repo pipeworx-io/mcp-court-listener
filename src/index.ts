@@ -1251,7 +1251,7 @@ async function callTool(name: string, args: Record<string, unknown>): Promise<un
       return findCase(mirrorFromArgs(args), args.name as string,
         Math.min(25, Math.max(1, Number(args.limit) || 5)));
     case 'lookup_citation':
-      return lookupCitation(mirrorFromArgs(args), args.citation as string);
+      return lookupCitation(mirrorFromArgs(args), args.citation as string, args._d1);
     case 'list_case_opinions':
       return listCaseOpinions(mirrorFromArgs(args), Number(args.cluster_id));
     case 'list_docket_filings':
@@ -1767,6 +1767,61 @@ function parseCitation(raw: string): { volume: number; reporter: string; page: s
   return { volume: Number(m[1]), reporter: m[2].trim(), page: m[3] };
 }
 
+/**
+ * Arkansas (and most other state supreme/appeals courts) switched to a
+ * public-domain / neutral citation format — "YYYY <Reporter> N" — where the
+ * volume is the FILING YEAR and the number after the reporter is the
+ * SEQUENTIAL OPINION NUMBER for that year, not a page. parseCitation above
+ * cannot tell the two formats apart; it only knows "digits, token, digits".
+ *
+ * page_range_ownership (citation_page_owner, migration 083) was built for
+ * traditional bound reporters, where a citations-table row IS a page and the
+ * gap between two rows IS the unprinted pages belonging to the earlier case.
+ * Run against a neutral citation, the same SQL instead treats the PRECEDING
+ * opinion number as a page and claims to "own" every number up to p_max_span
+ * past it — so "2026 Ark. 140" (opinion 140, not yet in the mirror) silently
+ * resolved to whichever earlier opinion happened to be numbered closest below
+ * it (fleet #2923). No page-range inference is valid for these reporters at
+ * all: an opinion number does not "span" a range the way a page range does,
+ * so it is exact match or nothing.
+ *
+ * Confirmed LIVE against the mirror (2026-10-10), on the reporter TOKEN the
+ * parser actually extracts — not the Bluebook spelling, which can differ
+ * (checked rather than trusted, per fleet #2923):
+ *   'Ark.'      — bug reproduces: 2026 Ark. 140 -> wrong case 2026 Ark. 114
+ *   'Ark. App.' — token confirmed (2026 Ark. App. 60 parses reporter "Ark. App.")
+ *   'UT'        — bug reproduces: 2026 UT 60 -> wrong case 2026 UT 33
+ *   'WI'        — bug reproduces: 2026 WI 60 -> wrong case 2026 WI 32
+ *   'CO'        — bug reproduces: 2026 CO 100 -> wrong case 2026 CO 65
+ *   'VT'        — bug reproduces: 2026 VT 60 -> wrong case 2026 VT 41
+ *   'OK','ND','SD','MT','WY','ME' — token confirmed via exact-match hits;
+ *     same mechanism, not separately forced into the bug for these.
+ * 'IL' and New Mexico/Ohio are NOT yet confirmed live and are included from
+ * the pattern alone — New Mexico ("NMSC"/"NMCA") and Ohio ("Ohio") only
+ * matter if a caller writes them with a space; their real citation form is
+ * hyphenated ("2015-NMSC-10", "2015-Ohio-10"), which parseCitation already
+ * rejects outright (no whitespace to match) before this function ever runs.
+ *
+ * The volume-is-a-year guard is defense in depth, not the primary signal:
+ * every token below is also usable, unsuffixed, as a much OLDER bound
+ * reporter in some jurisdictions (e.g. a 19th-century "5 Ohio 123"), and
+ * those volumes never fall in a plausible filing-year range.
+ */
+const NEUTRAL_CITATION_REPORTERS = new Set([
+  'Ark.', 'Ark. App.',
+  'OK', 'ND', 'SD', 'MT', 'WY', 'ME', 'VT', 'UT', 'WI', 'CO', 'IL',
+  'NMSC', 'NMCA', 'Ohio',
+]);
+
+export function isNeutralCitation(reporter: string, volume: number): boolean {
+  if (!NEUTRAL_CITATION_REPORTERS.has(reporter)) return false;
+  // The volume IS the filing year for these. +1 covers a case reported just
+  // before the calendar turns; 1990 predates every one of these
+  // jurisdictions' adoption of the format.
+  const year = new Date().getUTCFullYear();
+  return volume >= 1990 && volume <= year + 1;
+}
+
 async function citationsFor(m: NonNullable<Mirror>, clusterIds: number[]): Promise<Map<number, string[]>> {
   const byCluster = new Map<number, string[]>();
   if (!clusterIds.length) return byCluster;
@@ -2057,7 +2112,7 @@ async function findCase(m: Mirror, name: string, limit: number) {
   };
 }
 
-async function lookupCitation(m: Mirror, raw: string) {
+async function lookupCitation(m: Mirror, raw: string, arkD1?: unknown) {
   if (!m) return mirrorUnavailable('lookup_citation');
   const parsed = parseCitation(raw);
   if (!parsed) {
@@ -2069,6 +2124,7 @@ async function lookupCitation(m: Mirror, raw: string) {
     };
   }
   const { volume, reporter, page } = parsed;
+  const neutral = isNeutralCitation(reporter, volume);
   const cites = await pg<CitationRow>(
     m,
     `courtlistener_citations?volume=eq.${volume}&reporter=eq.${encodeURIComponent(reporter)}` +
@@ -2077,14 +2133,44 @@ async function lookupCitation(m: Mirror, raw: string) {
   let clusterIds = [...new Set(cites.map((c) => c.cluster_id).filter(Boolean))] as number[];
   let ownership: PageOwner[] = [];
 
+  // An Arkansas neutral citation ("2026 Ark. 140", "2026 Ark. App. 449") names
+  // an opinion by its number, not a page, and CourtListener runs months behind
+  // the Arkansas courts. With no exact match, ask arkansas-opinions (read from
+  // the courts' own archive) before the neutral-citation "opinion_not_held"
+  // answer below (fleet #2923) is given (fleet #2924).
+  if (!clusterIds.length) {
+    const ark = await arkansasFallThrough(arkD1, raw);
+    if (ark) return ark;
+  }
+
   // Nothing STARTS on that page — but a citation usually points at a page
   // INSIDE an opinion. Measured on 51 unresolved eval citations, 18 failed for
   // this reason alone: "487 U.S. 166" while volume 487 sits in the table,
   // because the case begins at 164. Ask who owns the page before concluding
   // the citation is unresolvable.
-  if (!clusterIds.length) {
+  //
+  // NEVER for a neutral citation (fleet #2923): the number after the
+  // reporter is an opinion count, not a page, so no span of "owned" numbers
+  // is valid — citation_page_owner would otherwise hand the nearest earlier
+  // opinion number a confident, wrong answer ("2026 Ark. 140" -> "2026 Ark.
+  // 114"). Exact match or nothing for these.
+  if (!clusterIds.length && !neutral) {
     ownership = await pageOwners(m, reporter, volume, page);
     clusterIds = [...new Set(ownership.map((o) => o.cluster_id))];
+  }
+
+  if (!clusterIds.length && neutral) {
+    const asOf = await mirrorSnapshotDate(m);
+    return {
+      found: false,
+      reason: 'opinion_not_held',
+      parsed,
+      message: `We do not hold opinion ${page} of ${volume} ${reporter}; neutral citations are opinion numbers, not pages, so no page-range inference applies.`,
+      hint: reporter.startsWith('Ark')
+        ? `${reporter} is a public-domain/neutral citation format — the number after it is the opinion count for ${volume}, not a page, so no page-range fallback applies here. Absence here is a gap in our coverage, not evidence the opinion does not exist; for Arkansas opinions decided from 2026-01-01 on, arkansas-opinions (ark_opinion, ark_coverage) reads the courts' own archive hourly.`
+        : `${reporter} is a public-domain/neutral citation format — the number after it is the opinion count for ${volume}, not a page, so no page-range fallback applies here. Absence here is a gap in our coverage, not evidence the opinion does not exist.`,
+      snapshot_date: asOf,
+    };
   }
 
   if (!clusterIds.length) {
@@ -2153,6 +2239,83 @@ async function lookupCitation(m: Mirror, raw: string) {
     source: 'court-listener',
     snapshot_date: clusters[0]?.snapshot_date ?? null,
     attribution: 'CourtListener / Free Law Project — Public Domain Mark.',
+  };
+}
+
+/**
+ * arkansas-opinions' store, read directly (fleet #2924). The gateway hands this
+ * pack the same D1 binding as `_d1` ("d1Binding": "ARK_OPINIONS_DB"). Read
+ * inline rather than by importing @pipeworx/arkansas-opinions, because a
+ * sibling-pack import makes court-listener a compound pack and drops it from
+ * npm releases. Column names must match
+ * workers/ark-opinions-collector/src/schema.ts; the fall-through test in
+ * mcps/arkansas-opinions seeds the store through the collector's own code, so
+ * a rename on either side reds there.
+ */
+interface ArkD1 {
+  prepare(sql: string): { bind(...v: unknown[]): { first<T>(): Promise<T | null> } };
+}
+interface ArkRow {
+  item_id: number; court: string; title: string; citation: string; decision_date: string | null;
+  docket: string | null; author: string | null; disposition: string | null; citation_status: string | null;
+  citation_status_note: string | null; source_url: string; pdf_url: string | null; text: string | null;
+  data_as_of: string | null;
+}
+
+function parseArkNeutral(raw: string): { year: number; reporter: 'Ark.' | 'Ark. App.'; number: number; citation: string } | null {
+  const m = /^\s*((?:19|20)\d{2})\s+Ark\.?\s*(App\.?)?\s+(\d{1,4})\s*$/i.exec(raw);
+  if (!m) return null;
+  const reporter = m[2] ? 'Ark. App.' : 'Ark.';
+  return { year: Number(m[1]), reporter, number: Number(m[3]), citation: `${m[1]} ${reporter} ${Number(m[3])}` };
+}
+
+async function arkansasFallThrough(arkD1: unknown, raw: string) {
+  const c = parseArkNeutral(raw);
+  // Neutral citations began in 2009; "171 Ark. 140" is a reporter volume.
+  if (!c || c.year < 2009 || !arkD1 || typeof (arkD1 as ArkD1).prepare !== 'function') return null;
+  let row: ArkRow | null = null;
+  try {
+    row = await (arkD1 as ArkD1)
+      .prepare(
+        `SELECT o.item_id, o.court, o.title, o.citation, o.decision_date, o.docket, o.author, o.disposition,
+           o.citation_status, o.citation_status_note, o.source_url, o.pdf_url,
+           substr(v.text, 1, 3000) AS text,
+           (SELECT max(finished_at) FROM collector_runs WHERE ok = 1) AS data_as_of
+         FROM opinions o LEFT JOIN opinion_versions v ON v.item_id = o.item_id AND v.is_current = 1
+         WHERE o.cite_year = ? AND o.cite_reporter = ? AND o.cite_number = ?
+         ORDER BY (o.doc_kind = 'opinion') DESC, o.item_id LIMIT 1`,
+      )
+      .bind(c.year, c.reporter, c.number)
+      .first<ArkRow>();
+  } catch {
+    // The arkansas-opinions store is unreachable: answer from CourtListener
+    // alone, exactly as before this fall-through existed.
+    return null;
+  }
+  if (!row) return null;
+  return {
+    citation: raw,
+    parsed: { volume: c.year, reporter: c.reporter, page: String(c.number) },
+    returned: 1,
+    resolved_by: 'arkansas_opinions_neutral_citation',
+    note: `CourtListener has no case at ${c.citation}. The Arkansas courts' own opinion archive does; this answer comes from the arkansas-opinions pack, which reads it hourly. Call ark_opinion for the full text and version history.`,
+    cases: [{
+      case_name: row.title,
+      court: row.court === 'supreme' ? 'Arkansas Supreme Court' : 'Arkansas Court of Appeals',
+      date_filed: row.decision_date,
+      docket_number: row.docket,
+      citations: [c.citation],
+      author: row.author,
+      disposition: row.disposition,
+      citation_status: row.citation_status ?? 'not_yet_read',
+      citation_status_note: row.citation_status_note ?? 'The court has listed this opinion and its text has not been read yet; do not treat it as citable until it is.',
+      excerpt: row.text,
+      source_url: row.source_url,
+      pdf_url: row.pdf_url,
+    }],
+    source: 'arkansas-opinions',
+    data_as_of: row.data_as_of,
+    attribution: 'Arkansas Judiciary, official opinion archive (opinions.arcourts.gov).',
   };
 }
 
