@@ -2258,7 +2258,7 @@ interface ArkD1 {
 interface ArkRow {
   item_id: number; court: string; title: string; citation: string; decision_date: string | null;
   docket: string | null; author: string | null; disposition: string | null; citation_status: string | null;
-  citation_status_note: string | null; source_url: string; pdf_url: string | null; text: string | null;
+  citation_status_note: string | null; source_url: string; text: string | null;
   data_as_of: string | null;
 }
 
@@ -2278,7 +2278,7 @@ async function arkansasFallThrough(arkD1: unknown, raw: string) {
     row = await (arkD1 as ArkD1)
       .prepare(
         `SELECT o.item_id, o.court, o.title, o.citation, o.decision_date, o.docket, o.author, o.disposition,
-           o.citation_status, o.citation_status_note, o.source_url, o.pdf_url,
+           o.citation_status, o.citation_status_note, o.source_url,
            substr(v.text, 1, 3000) AS text,
            (SELECT max(finished_at) FROM collector_runs WHERE ok = 1) AS data_as_of
          FROM opinions o LEFT JOIN opinion_versions v ON v.item_id = o.item_id AND v.is_current = 1
@@ -2311,11 +2311,10 @@ async function arkansasFallThrough(arkD1: unknown, raw: string) {
       citation_status_note: row.citation_status_note ?? 'The court has listed this opinion and its text has not been read yet; do not treat it as citable until it is.',
       excerpt: row.text,
       source_url: row.source_url,
-      pdf_url: row.pdf_url,
     }],
     source: 'arkansas-opinions',
     data_as_of: row.data_as_of,
-    attribution: 'Arkansas Judiciary, official opinion archive (opinions.arcourts.gov).',
+    attribution: 'Arkansas Judiciary, official opinions archive.',
   };
 }
 
