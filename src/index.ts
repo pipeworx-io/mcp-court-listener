@@ -25,6 +25,140 @@ interface McpToolExport {
 }
 
 /**
+ * Shared full-text-search helpers for every caller of the FTS5 case/statute
+ * search shard (workers/gateway/src/search-shard.ts, `op match ?`).
+ *
+ * THE BUG THIS FIXES (fleet #3070). Several packs sent the caller's raw text
+ * straight into FTS5's MATCH operator. A comma, a '?', or an AND/OR/NOT/NEAR
+ * in the question is FTS5 syntax, so the shard throws a SQLite error — and
+ * the pack reported that as `index_unreachable`, an infrastructure failure,
+ * when the real problem was punctuation in a plain-language question. Even
+ * once the syntax is sanitized, ANDing every word of a whole sentence
+ * ("what does X require") returns zero hits, because no statute section
+ * contains the literal word "what" — a silent, wrong "no match" for what is
+ * actually a query-shape problem, not an absence of an answer.
+ *
+ * Two packs independently built the identical fix — illinois-code
+ * (bdc38b2c2) and france-legi's core.ts — before this existed. Lifted here so
+ * every other caller of the shard (north-carolina-code, indiana-code,
+ * wyoming-code, the court-listener case-law fan-out in caselaw-search.ts, and
+ * any future statute pack) gets it for free instead of re-deriving it a
+ * third, fourth, fifth time.
+ */
+
+type FtsMode = 'all' | 'any';
+
+/**
+ * Caller text -> a safe FTS5 MATCH expression. Every word (or quoted phrase)
+ * is re-quoted as an FTS5 string literal, so FTS5 operators (AND/OR/NOT/
+ * NEAR), column filters, and stray punctuation in a plain-language question
+ * — commas, question marks, the very things a real caller's sentence is full
+ * of — cannot change the query's meaning or throw a syntax error. Non-letter,
+ * non-digit characters are simply dropped by the `\p{L}\p{N}` match, which is
+ * what turns "bond, and license" (a syntax error against `op match ?`) into
+ * a clean three-term query.
+ *
+ * `mode: 'all'` ANDs every term (precise, for a short deliberate query);
+ * `mode: 'any'` ORs them (a relaxed retry for a whole sentence — see
+ * `shardSearch` below, which is the fallback policy this exists to support).
+ *
+ * `extraTerm`, when given, is ANDed on as its own already-resolved literal
+ * (e.g. a jurisdiction/code token every hit must also carry). Resolving a
+ * caller-facing id into that literal — france-legi's `codeToken` — is the
+ * caller's job, not this function's; this only assembles the final MATCH
+ * string.
+ *
+ * Returns null when the text has no searchable words at all (e.g. "???").
+ */
+function ftsQuery(text: string, mode: FtsMode, extraTerm?: string | null): string | null {
+  const parts: string[] = [];
+  const re = /"([^"]+)"|([\p{L}\p{N}]+)/gu;
+  for (const m of text.matchAll(re)) {
+    const raw = m[1] ?? m[2];
+    const words = raw.match(/[\p{L}\p{N}]+/gu);
+    if (!words?.length) continue;
+    parts.push(`"${words.join(' ')}"`);
+  }
+  if (!parts.length) return null;
+  const body = parts.length === 1 ? parts[0] : mode === 'all' ? parts.join(' AND ') : `(${parts.join(' OR ')})`;
+  return extraTerm ? `${body} AND "${extraTerm}"` : body;
+}
+
+interface FtsHit {
+  opinion_id: number;
+  score: number;
+}
+
+interface FtsShardResult {
+  hits: FtsHit[];
+  /** Which query actually produced `hits`. Null only when the text had no
+   *  searchable words at all (`ftsQuery` returned null) and the shard was
+   *  never called. */
+  mode: FtsMode | null;
+  /** False only on a genuine shard/transport failure — non-2xx, a network
+   *  error, or a body that doesn't parse. That is a real infrastructure
+   *  problem and callers MUST report it as one (e.g. `index_unreachable`).
+   *  A legitimate zero-hit search still reports `ok: true` with `hits: []`
+   *  — callers MUST NOT collapse that distinction (silent-zero-policy). */
+  ok: boolean;
+}
+
+interface ShardStub {
+  fetch(url: string, init: RequestInit): Promise<Response>;
+}
+
+/**
+ * Query ONE shard stub with the ALL->ANY fallback: try an ALL-words match
+ * first (the precise read of a short, deliberate query — "currency exchange
+ * license fee"), and only retry with an OR-ranked ANY-word match when the
+ * query has more than one word and the ALL attempt came back empty. A long
+ * plain-language question ANDs every one of its words, including stopwords
+ * like "what" or "does" that statute/opinion text is unlikely to contain
+ * verbatim — that AND-of-a-sentence zero is not evidence the answer is
+ * absent, it's the ALL mode being too strict for a sentence shaped input.
+ * bm25's own idf weighting discounts a word that appears in nearly every
+ * document, so the ANY retry needs no separate stopword list (same reasoning
+ * search-shard.ts's own "NO STOPWORD LIST" note gives for not stripping
+ * function words from the index itself).
+ */
+async function shardSearch(
+  stub: ShardStub,
+  text: string,
+  limit: number,
+  extraTerm?: string | null,
+): Promise<FtsShardResult> {
+  const runQuery = async (matchQuery: string): Promise<FtsHit[]> => {
+    const res = await stub.fetch('https://shard/query', {
+      method: 'POST',
+      body: JSON.stringify({ q: matchQuery, limit }),
+      headers: { 'Content-Type': 'application/json' },
+    });
+    if (!res.ok) throw new Error(`shard_http_${res.status}`);
+    const out = (await res.json()) as { results?: FtsHit[] };
+    return out.results ?? [];
+  };
+
+  const allQuery = ftsQuery(text, 'all', extraTerm);
+  if (!allQuery) return { hits: [], mode: null, ok: true };
+
+  try {
+    let hits = await runQuery(allQuery);
+    let mode: FtsMode = 'all';
+    if (!hits.length && /\s/.test(text)) {
+      const anyQuery = ftsQuery(text, 'any', extraTerm);
+      if (anyQuery) {
+        hits = await runQuery(anyQuery);
+        mode = 'any';
+      }
+    }
+    return { hits, mode, ok: true };
+  } catch {
+    return { hits: [], mode: null, ok: false };
+  }
+}
+
+
+/**
  * Fan out a full-text query across the case-law search shards and merge.
  *
  * Lives in shared because both the gateway (which owns the binding) and the
@@ -33,7 +167,23 @@ interface McpToolExport {
  *
  * The index is FTS5 inside SQLite-backed Durable Objects — six of them, because
  * one holds 10 GB and the index is ~46 GB. See workers/gateway/src/search-shard.ts.
+ *
+ * QUERY SAFETY (fleet #3070). This used to send the caller's raw text into
+ * every shard's `op match ?` and never checked `res.ok` before parsing the
+ * body — so a comma or '?' in the question threw a SQLite FTS5 syntax error
+ * inside the shard (a 500 with `{error:'shard_error',...}`), and because the
+ * body was parsed unconditionally, `out.results` came back `undefined`,
+ * `?? []` turned that into an empty hit list, and EVERY shard "answered"
+ * with zero results — a real infrastructure failure read as a clean,
+ * confident "no case matches", the worse of the two silent-zero shapes.
+ * `ftsQuery` (shared, also used by illinois-code/france-legi/the state
+ * statute packs) now quotes the text into a safe MATCH expression before it
+ * ever reaches a shard, `queryShards` below throws on a non-2xx response so
+ * a shard error counts as NOT answered rather than as an empty answer, and
+ * an ALL-words miss retries ANY-word once across all shards before giving up
+ * — the same ALL->ANY fallback the single-shard statute packs use.
  */
+
 
 const SHARD_COUNT = 6;
 
@@ -72,31 +222,24 @@ interface SearchHit {
  * The text score still matters: citation count alone would return the same
  * famous cases for every query.
  */
-async function searchCaseLaw(
-  ns: DurableObjectNamespace | undefined,
-  q: string,
-  limit: number,
-  opts: { supabaseUrl?: string; supabaseKey?: string } = {},
-): Promise<{ results: SearchHit[]; shards_answered: number; ranking_note: string }> {
-  if (!ns) {
-    return {
-      results: [],
-      shards_answered: 0,
-      ranking_note: 'search shards are not reachable from this deployment',
-    };
-  }
-
-  // Over-fetch per shard: the blend can reorder substantially, so merging only
-  // each shard's top few would discard cases that the citation signal promotes.
-  const perShard = Math.min(100, Math.max(limit * 3, 30));
+/** Fan one already-safe MATCH expression out across all six shards and merge.
+ *  A shard that errors (non-2xx, network failure, bad JSON) is REJECTED, not
+ *  counted as answered with zero hits — the fix for the silent-zero bug
+ *  described above. */
+async function queryShards(
+  ns: DurableObjectNamespace,
+  matchQuery: string,
+  perShard: number,
+): Promise<{ pooled: SearchHit[]; answered: number }> {
   const settled = await Promise.allSettled(
     shardIds().map(async (s) => {
       const stub = ns.get(ns.idFromName(`shard-${s}`));
       const r = await stub.fetch('https://shard/query', {
         method: 'POST',
-        body: JSON.stringify({ q, limit: perShard }),
+        body: JSON.stringify({ q: matchQuery, limit: perShard }),
         headers: { 'Content-Type': 'application/json' },
       });
+      if (!r.ok) throw new Error(`shard_http_${r.status}`);
       const out = (await r.json()) as { results?: { opinion_id: number; score: number }[] };
       return (out.results ?? []).map((h) => ({ ...h, shard: s }));
     }),
@@ -116,6 +259,55 @@ async function searchCaseLaw(
     const span = worst - best || 1;
     for (const h of hits) pooled.push({ ...h, score: (worst - h.score) / span });
   }
+  return { pooled, answered: answered.length };
+}
+
+async function searchCaseLaw(
+  ns: DurableObjectNamespace | undefined,
+  q: string,
+  limit: number,
+  opts: { supabaseUrl?: string; supabaseKey?: string } = {},
+): Promise<{ results: SearchHit[]; shards_answered: number; ranking_note: string; match: FtsMode | null }> {
+  if (!ns) {
+    return {
+      results: [],
+      shards_answered: 0,
+      ranking_note: 'search shards are not reachable from this deployment',
+      match: null,
+    };
+  }
+
+  // Over-fetch per shard: the blend can reorder substantially, so merging only
+  // each shard's top few would discard cases that the citation signal promotes.
+  const perShard = Math.min(100, Math.max(limit * 3, 30));
+
+  const allQuery = ftsQuery(q, 'all');
+  if (!allQuery) {
+    // No searchable words at all (e.g. "???") — this is a fact about the
+    // query, not about the shards, so it must not read as index_unreachable.
+    return {
+      results: [],
+      shards_answered: SHARD_COUNT,
+      ranking_note: 'query contained no searchable words',
+      match: null,
+    };
+  }
+
+  let { pooled, answered } = await queryShards(ns, allQuery, perShard);
+  let mode: FtsMode = 'all';
+  // Same ALL->ANY fallback as the single-shard statute packs: a whole
+  // plain-language question ANDs stopwords no opinion contains verbatim, so
+  // an ALL-mode zero across healthy shards gets one relaxed OR retry before
+  // this is reported as "nothing matched".
+  if (!pooled.length && answered > 0 && /\s/.test(q)) {
+    const anyQuery = ftsQuery(q, 'any');
+    if (anyQuery) {
+      const retry = await queryShards(ns, anyQuery, perShard);
+      pooled = retry.pooled;
+      answered = Math.max(answered, retry.answered);
+      mode = 'any';
+    }
+  }
 
   const cites = await citationCounts(pooled.map((h) => h.opinion_id), opts);
   // log1p, not raw: citation counts are power-law distributed (Miranda has
@@ -132,9 +324,10 @@ async function searchCaseLaw(
 
   return {
     results: ranked.slice(0, limit),
-    shards_answered: answered.length,
+    shards_answered: answered,
     ranking_note:
       'Relevance blends BM25 text match (60%) with how often later courts have cited the case (40%, log-scaled). Citation count is global, so it makes results comparable across shards in a way BM25 alone is not.',
+    match: mode,
   };
 }
 
@@ -1680,6 +1873,7 @@ async function searchCaseLawTool(args: Record<string, unknown>) {
     query: q,
     returned: out.results.length,
     shards_answered: out.shards_answered,
+    match: out.match === 'any' ? 'any_word' : out.match === 'all' ? 'all_words' : null,
     results: out.results.map((r) => ({
       opinion_id: r.opinion_id,
       relevance: Math.round(r.score * 1000) / 1000,
