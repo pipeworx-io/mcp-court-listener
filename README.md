@@ -4,7 +4,7 @@ US court opinions from Free Law Project's CourtListener: **8.3 million opinions
 across 3,361 courts**, going back to 1761. The largest free, structured database
 of American case law.
 
-Part of [Pipeworx](https://pipeworx.io) — an MCP gateway connecting AI agents to 1800+ live data sources. This is an independent, unofficial integration — not affiliated with, endorsed by, or published by the upstream provider.
+Part of [Pipeworx](https://pipeworx.io) — an MCP gateway connecting AI agents to 1854+ live data sources. This is an independent, unofficial integration — not affiliated with, endorsed by, or published by the upstream provider.
 
 Most of it is **state** law. That surprises people, and it is the point:
 
@@ -24,6 +24,11 @@ assembled and addressable, are not.
 `search_opinions` and `search_dockets` search upstream by topic and are subject
 to CourtListener's throttling. A free token from Free Law Project lifts it.
 
+`find_case_patents` optionally uses a USPTO Open Data Portal platform key (the
+same one the `patents` pack uses) to attach patent metadata — it returns the
+asserted patent numbers either way, just without titles/dates when no key is
+configured.
+
 ## Tools
 
 | Tool | Use it when |
@@ -37,10 +42,49 @@ to CourtListener's throttling. A free token from Free Law Project lifts it.
 | `list_docket_filings` | You have a `docket_id` and want the **docket sheet** — what was filed, when |
 | `get_docket_filing` | You have a `document_id` and want that one filing + its PDF |
 | `search_court_filings` | You want the **text of filings** — motions, briefs, orders — not opinions |
+| `find_case_patents` | Patent case → its asserted patent numbers (with USPTO metadata) → its defendants, in one call |
 
 For litigation documents the path is `search_dockets` → `list_docket_filings` →
 `get_docket_filing`. Every filing tool is keyed by `docket_id`, and only
 `search_dockets` produces one — a PACER case number will not resolve.
+
+### `find_case_patents` — patent litigation cross-reference
+
+Joins a RECAP docket (Free Law Project / CourtListener) to patent metadata
+(U.S. Patent and Trademark Office, Open Data Portal). Pass a `case_name`
+(optionally with `court`) or a `docket_id` already known from `search_dockets`:
+
+```json
+{"case_name": "TurboCode LLC v. Quectel Wireless Solutions", "court": "txed"}
+```
+
+returns the docket, the plaintiff(s) and defendant(s) read off the case
+caption, and every patent number that appears in the docket's own filing
+text, each one naming the filing it was found in and the exact label that
+preceded it (e.g. `"United States Patent No."`). When a USPTO platform key is
+configured (the same `PLATFORM_USPTO_KEY` the `patents` pack uses), each
+number carries title, status, grant date and first inventor; without one the
+number is still returned, with `metadata_unavailable_reason` saying why.
+
+**Thin cross-reference, by design — this never buys a PACER document.**
+Patent numbers come only from text RECAP already indexes: the clerk's own
+docket-entry descriptions (an exhibit filed as *"United States Patent No.
+6,813,742"* reads straight off the entry, no purchase needed) and the text
+excerpt of any document someone **else** has already bought from PACER. A
+patent asserted only inside an unpurchased complaint PDF will not surface —
+the response says how many filings it scanned and that a `pdf_available`
+document was never fetched, rather than claiming completeness.
+
+Extraction is conservative on purpose: a number only counts as an asserted
+patent when the literal word "Patent" immediately precedes "No./Nos./Number(s)"
+in the source text — a filing fee, a receipt number, a PageID or an attachment
+index sitting nearby never matches just because it is a number near a number.
+Defendants come from the **case caption** CourtListener indexed (not an
+authenticated PACER party table), split on `";"` / `" and "` only — never a
+bare comma, since a corporate suffix ("Co., Ltd", "Inc.,") routinely contains
+one and splitting on it would cut a single defendant's name in two. An "et
+al." caption is reported as `defendants_truncated: true` rather than silently
+dropped.
 
 Opinions and filings answer different questions: an opinion is what a court
 **decided**, a filing is what the parties **filed**.
@@ -125,6 +169,9 @@ Data is CourtListener / Free Law Project, published under the Public Domain
 Mark. Free Law Project funds and maintains the corpus. If this pack is useful to
 you, <https://free.law/donate/> is where that goes.
 
+`find_case_patents`' patent metadata is the U.S. Patent and Trademark Office's
+Open Data Portal — a US government work, public domain.
+
 <!-- Maintainers: refresh procedure and design notes are in
      docs/courtlistener-mirror-plan.md (internal). -->
 
@@ -172,7 +219,7 @@ directly, instead of just this one's:
 }
 ```
 
-Both URLs reach the same gateway and the same 1800+ data sources. The
+Both URLs reach the same gateway and the same 1854+ data sources. The
 only difference is which pack's tools are listed **directly**; `ask_pipeworx`
 reaches all of them from either one.
 

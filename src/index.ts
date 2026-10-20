@@ -1040,6 +1040,254 @@ function pickMessage(node: unknown, depth: number): string | null {
 function collapse(s: string): string {
   return s.replace(/\s+/g, ' ').trim();
 }
+
+// ── Bounded readers — peak memory, not just wall time (fleet #3322) ──────
+//
+// `parseJson` above does `await res.text()` then `JSON.parse(raw)`, so a
+// multi-megabyte upstream body is held TWICE at peak: once as the raw string
+// and once as the object graph (which for an array of small objects runs
+// several times the byte size). Nothing in `workers/gateway` can see that
+// peak — it happens inside the pack, before any gateway code holds a payload —
+// which is why the gateway-side payload caps of #3293 and #3320 did not move
+// the 503/1102 rate at all.
+//
+// Measured on the live gateway, 2026-10-19, sha fa5de5c34, direct tools/call:
+//   statcan_list_cubes  8,049,566 B   <- one upstream array, no limit argument
+//   gnomad_gene BRCA1   2,732,706 B
+// Five of those in flight at the quality runner's width is ~40 MB of parse
+// peak against a 128 MB isolate; Cloudflare kills the isolate and every
+// request in flight returns 503/1102, which is why the victims look random.
+//
+// `readJsonArrayPrefix` is the fix for the dominant shape: an upstream that
+// returns one enormous top-level JSON array with no server-side paging. It
+// parses elements off the stream and DISCARDS the consumed bytes, so peak
+// retained memory is one element plus one chunk rather than the whole body,
+// and it cancels the body as soon as it has what it was asked for.
+
+/** Default ceiling for a single upstream JSON body read into an isolate.
+ *  Chosen so the known tail (statcan 8.0 MB, gnomad 2.7 MB) is bounded well
+ *  below the point where a handful of concurrent reads exhausts 128 MB. */
+const DEFAULT_MAX_JSON_BYTES = 1_500_000;
+
+interface JsonArrayPrefix<T> {
+  /** The decoded elements, at most `maxItems` of them. */
+  items: T[];
+  /** True when the upstream array had more elements than we read. */
+  truncated: boolean;
+  /** Bytes actually pulled off the socket — the number that bounds memory. */
+  bytesRead: number;
+  /** `Content-Length` if the upstream declared one, else null. */
+  declaredBytes: number | null;
+}
+
+/**
+ * Read the FIRST `maxItems` elements of a top-level JSON array off a response
+ * stream without ever materialising the whole body.
+ *
+ * Use this instead of `parseJson` when the upstream returns one big array and
+ * offers no `limit`/`offset` of its own. Peak retained memory is one element
+ * plus the current chunk; the body is cancelled as soon as `maxItems` is
+ * reached, so the remaining megabytes are never transferred at all.
+ *
+ *     const { items, truncated } = await readJsonArrayPrefix<Cube>(
+ *       res, 'StatCan WDS', { maxItems: limit + offset });
+ *
+ * `maxBytes` is a second, independent backstop for a pathological element (a
+ * single 50 MB object): hitting it stops the read and sets `truncated`, rather
+ * than throwing, because a partial answer plus an explicit truncated flag is
+ * more useful to a caller than an error.
+ */
+async function readJsonArrayPrefix<T>(
+  res: Response,
+  name: string,
+  opts: { maxItems: number; maxBytes?: number },
+): Promise<JsonArrayPrefix<T>> {
+  const maxBytes = opts.maxBytes ?? DEFAULT_MAX_JSON_BYTES;
+  const declaredRaw = Number(res.headers.get('content-length'));
+  const declaredBytes = Number.isFinite(declaredRaw) && declaredRaw > 0 ? declaredRaw : null;
+
+  // No streaming body available (a mock, or an already-buffered response):
+  // fall back to the whole-text path so behaviour stays correct, just unbounded.
+  if (!res.body) {
+    const all = await parseJson<T[]>(res, name);
+    if (!Array.isArray(all)) throw new Error(`upstream_down: ${name} returned ${typeof all} where a JSON array was expected.`);
+    return {
+      items: all.slice(0, opts.maxItems),
+      truncated: all.length > opts.maxItems,
+      bytesRead: declaredBytes ?? 0,
+      declaredBytes,
+    };
+  }
+
+  const reader = res.body.getReader();
+  const decoder = new TextDecoder();
+  const items: T[] = [];
+
+  let buf = '';
+  let scan = 0;
+  let bytesRead = 0;
+  let started = false; // consumed the opening '['
+  let arrayEnded = false;
+  let depth = 0;
+  let inStr = false;
+  let esc = false;
+  let elemStart = -1;
+  let truncated = false;
+
+  const push = (text: string) => {
+    const t = text.trim();
+    if (!t) return;
+    items.push(JSON.parse(t) as T);
+  };
+
+  try {
+    outer: while (items.length < opts.maxItems && !arrayEnded) {
+      const { value, done } = await reader.read();
+      if (done) break;
+      bytesRead += value.byteLength;
+      buf += decoder.decode(value, { stream: true });
+      if (bytesRead > maxBytes) { truncated = true; break; }
+
+      for (; scan < buf.length; scan++) {
+        const ch = buf[scan];
+
+        if (inStr) {
+          if (esc) { esc = false; continue; }
+          if (ch === '\\') { esc = true; continue; }
+          if (ch === '"') inStr = false;
+          continue;
+        }
+
+        if (!started) {
+          if (ch === '[') { started = true; continue; }
+          if (ch.trim() === '') continue;
+          throw new Error(
+            `upstream_down: ${name} returned a body that does not begin with a JSON array (saw ${JSON.stringify(ch)}). ` +
+              'This reader is only for upstreams that answer with one top-level array.',
+          );
+        }
+
+        if (ch === '"') { if (depth === 0 && elemStart < 0) elemStart = scan; inStr = true; continue; }
+
+        if (ch === '{' || ch === '[') {
+          if (depth === 0 && elemStart < 0) elemStart = scan;
+          depth++;
+          continue;
+        }
+
+        if (ch === '}' || ch === ']') {
+          if (depth > 0) {
+            depth--;
+            if (depth === 0 && elemStart >= 0) {
+              push(buf.slice(elemStart, scan + 1));
+              elemStart = -1;
+              if (items.length >= opts.maxItems) { truncated = true; scan++; break outer; }
+            }
+            continue;
+          }
+          // depth 0 and a closing bracket: the end of the top-level array.
+          if (elemStart >= 0) { push(buf.slice(elemStart, scan)); elemStart = -1; }
+          arrayEnded = true;
+          break outer;
+        }
+
+        if (ch === ',' && depth === 0) {
+          if (elemStart >= 0) {
+            push(buf.slice(elemStart, scan));
+            elemStart = -1;
+            if (items.length >= opts.maxItems) { truncated = true; scan++; break outer; }
+          }
+          continue;
+        }
+
+        // A bare scalar element (number / true / false / null).
+        if (depth === 0 && elemStart < 0 && ch.trim() !== '') elemStart = scan;
+      }
+
+      // Drop everything already consumed. THIS is what bounds memory: without
+      // it `buf` grows to the full body and the reader is streaming in name only.
+      if (elemStart >= 0) {
+        buf = buf.slice(elemStart);
+        scan -= elemStart;
+        elemStart = 0;
+      } else {
+        buf = buf.slice(scan);
+        scan = 0;
+      }
+    }
+  } finally {
+    // Cancel rather than drain: the point is that the remaining megabytes are
+    // never transferred. A cancel on an already-finished body is a no-op.
+    await reader.cancel().catch(() => {});
+  }
+
+  return { items, truncated, bytesRead, declaredBytes };
+}
+
+/**
+ * `parseJson`, with a hard ceiling on how many bytes are read.
+ *
+ * For an upstream whose body is not a single array (so `readJsonArrayPrefix`
+ * does not apply) but which can still answer with megabytes. Unlike the array
+ * reader this one THROWS when the cap is hit, because a truncated prefix of an
+ * arbitrary JSON document is not parseable and there is no partial answer to
+ * hand back. A declared `Content-Length` over the cap is refused before a
+ * single chunk is read.
+ */
+async function parseJsonBounded<T>(
+  res: Response,
+  name: string,
+  maxBytes: number = DEFAULT_MAX_JSON_BYTES,
+): Promise<T> {
+  const declaredRaw = Number(res.headers.get('content-length'));
+  const declared = Number.isFinite(declaredRaw) && declaredRaw > 0 ? declaredRaw : null;
+
+  const tooBig = (n: number) =>
+    new Error(
+      `upstream_down: ${name} answered with ${n.toLocaleString()} bytes, over this pack's ${maxBytes.toLocaleString()}-byte ceiling. ` +
+        'The body is not read past the ceiling on purpose — a few concurrent reads of a body that size exhaust the ' +
+        'Worker isolate and take every other in-flight request down with them. Narrow the request (a smaller range, ' +
+        'a specific id, or a lower limit) and retry.',
+    );
+
+  if (declared !== null && declared > maxBytes) {
+    await res.body?.cancel().catch(() => {});
+    throw tooBig(declared);
+  }
+  if (!res.body) return parseJson<T>(res, name);
+
+  const reader = res.body.getReader();
+  const decoder = new TextDecoder();
+  let raw = '';
+  let bytesRead = 0;
+  try {
+    for (;;) {
+      const { value, done } = await reader.read();
+      if (done) break;
+      bytesRead += value.byteLength;
+      if (bytesRead > maxBytes) throw tooBig(bytesRead);
+      raw += decoder.decode(value, { stream: true });
+    }
+    raw += decoder.decode();
+  } finally {
+    await reader.cancel().catch(() => {});
+  }
+
+  if (!raw.trim()) {
+    throw new Error(
+      `upstream_down: ${name} answered HTTP ${res.status} with an EMPTY body where JSON was expected. ` +
+        'Nothing about the request can cause this — it is an upstream fault, and the same call may well work on retry.',
+    );
+  }
+  try {
+    return JSON.parse(raw) as T;
+  } catch {
+    throw new Error(
+      `upstream_down: ${name} answered HTTP ${res.status} with a body that is not valid JSON. ` +
+        `It begins: ${stripMarkup(raw).slice(0, 120) || '(unreadable)'}`,
+    );
+  }
+}
 /**
  * CourtListener MCP — Free Law Project's CourtListener API (v4).
  *
@@ -1064,6 +1312,12 @@ function collapse(s: string): string {
  * - lookup_citation: reporter citation -> case (keyless)
  * - list_case_opinions: majority/concurrence/dissent for a case (keyless)
  * - get_opinion: full opinion text by id (keyless)
+ * - find_case_patents: patent litigation cross-reference (fleet #3243) — a
+ *   named case to its docket, the patent numbers its own docket entries
+ *   explicitly label, and its defendants. Joins RECAP docket/filing data
+ *   (above) with USPTO Open Data Portal patent metadata, so it needs
+ *   PLATFORM_USPTO_KEY the same way the `patents` pack does; without it the
+ *   patent numbers still come back, just without metadata.
  */
 
 
@@ -1417,6 +1671,22 @@ const tools: McpToolExport['tools'] = [
       required: ['query'],
     },
   },
+  {
+    name: 'find_case_patents',
+    description:
+      'Patent litigation cross-reference: a named US district-court case to its docket, its asserted patent NUMBERS, and its defendants. Pass a case name (e.g. "TurboCode LLC v. Quectel Wireless Solutions") or a docket_id already known from search_dockets. Patent numbers come ONLY from text CourtListener/RECAP already indexes — the clerk\'s own docket-entry descriptions (e.g. an exhibit filed as "United States Patent No. 6,813,742") and the text of any document someone else has already purchased from PACER — never from buying a PACER document. Each patent number says exactly which filing it was found in and the label that preceded it, and carries USPTO patent metadata (title, status, grant date, inventor) when a platform USPTO key is configured — the number is still returned without one. Defendants come from the case caption CourtListener indexed, not an authenticated PACER party list, and say so. This is a thin cross-reference: a patent asserted only inside an unpurchased complaint PDF, or a defendant list CourtListener truncated with "et al.", will not be complete here — the response names that gap rather than hiding it.',
+    summary: 'A named patent-infringement case joined to its asserted patent numbers (with USPTO metadata) and its defendants.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        case_name: { type: 'string', description: 'Case name, e.g. "TurboCode LLC v. Quectel Wireless Solutions". Required unless docket_id is given.' },
+        docket_id: { type: 'number', description: 'Docket id already known from search_dockets. Skips the case-name lookup.' },
+        court: { type: 'string', description: 'Optional court filter when searching by case_name (e.g. "txed" for E.D. Texas).' },
+        filing_limit: { type: 'number', description: 'How many docket filings to scan for patent numbers (default 50, max 100).' },
+      },
+      required: [],
+    },
+  },
 ];
 
 // ── callTool dispatcher ───────────────────────────────────────────────
@@ -1453,6 +1723,8 @@ async function callTool(name: string, args: Record<string, unknown>): Promise<un
       return getDocketFiling(Number(args.document_id));
     case 'search_court_filings':
       return searchCourtFilings(args.query as string, args.court as string | undefined, limitArg(args.limit));
+    case 'find_case_patents':
+      return findCasePatents(args);
     default:
       throw new Error(`Unknown tool: ${name}`);
   }
@@ -2855,6 +3127,297 @@ async function searchCourtFilings(query: string, court: string | undefined, limi
       reason: 'no_matches',
       hint: 'No RECAP filing text matched. RECAP covers documents fetched from PACER, not every federal filing, and matching is on the filing text and the clerk\'s docket description. Try fewer or unquoted terms, drop the court filter, or search appellate rulings instead with search_case_law.',
     }),
+  };
+}
+
+// ── Patent litigation cross-reference (fleet #3243) ────────────────────
+//
+// Joins a RECAP docket (the dockets/filings tools above) with USPTO patent
+// metadata. Thin cross-reference, by design: it reads patent numbers out of
+// text RECAP already indexes — the clerk's own docket-entry descriptions,
+// and the text excerpt of any document someone ELSE has already purchased
+// from PACER — and never buys a PACER document to look inside it. A patent
+// asserted only inside an unpurchased complaint PDF will not surface here;
+// that is a real RECAP coverage gap, not a bug in the extraction.
+
+const US_PATENT_NUMBER_LABEL =
+  /\b(?:U\.?S\.?\s+|United\s+States\s+)?Patents?\s+(?:No\.?s?\.?|Numbers?)\s*:?\s*/gi;
+
+// A US utility/design/reissue patent number as it is actually written in
+// prose: 1–2 leading digits, then one to three comma-grouped triplets
+// (utility "6,813,742"; design "D987,654"; reissue "RE49,123"). Deliberately
+// NOT a bare digit run — nothing here matches a page count, a filing fee or
+// a PACER case id, because none of those are comma-grouped, and a dollar
+// amount or an attachment number immediately before the match is excluded
+// below by its leading '$'/'#'.
+const PATENT_NUMBER_TOKEN = /\b(RE|D)?(\d{1,2}(?:,\d{3}){1,3})\b/g;
+
+type ProjectedFiling = ReturnType<typeof projectFiling>;
+
+interface AssertedPatentHit {
+  patent_number: string;
+  label_matched: string;
+  found_in: {
+    document_id: number | null;
+    entry_number: number | null;
+    date_filed: string | null;
+    description_excerpt: string;
+  };
+}
+
+/**
+ * Scan one filing's clerk-written description, and its text excerpt where
+ * RECAP already holds one, for a patent number EXPLICITLY labeled as such —
+ * "Patent No." / "Patent Nos." / "U.S. Patent Number" immediately followed by
+ * the number. Conservative by construction: the regex requires the literal
+ * word "Patent" directly before "No./Nos./Number(s)", so a bare number, a
+ * filing fee, a receipt number or a PageID never matches just because a
+ * number happens to sit nearby.
+ */
+function extractAssertedPatents(filing: ProjectedFiling): AssertedPatentHit[] {
+  const hits: AssertedPatentHit[] = [];
+  const fields = [filing.description, filing.text_excerpt].filter(
+    (f): f is string => typeof f === 'string' && f.length > 0,
+  );
+  for (const field of fields) {
+    for (const labelMatch of field.matchAll(US_PATENT_NUMBER_LABEL)) {
+      const label = labelMatch[0].trim();
+      const windowStart = labelMatch.index! + labelMatch[0].length;
+      // Stop at the next clause boundary so an unrelated item later in the
+      // same parenthetical ("# 2 Civil Cover Sheet") is never read as part
+      // of the patent list.
+      let window = field.slice(windowStart, windowStart + 200);
+      const boundary = window.search(/\(Entered:|Exhibit\b|\)\s*\(|\.\s[A-Z]/);
+      if (boundary >= 0) window = window.slice(0, boundary);
+      for (const numMatch of window.matchAll(PATENT_NUMBER_TOKEN)) {
+        const precedingChar = window[numMatch.index! - 1];
+        if (precedingChar === '$' || precedingChar === '#') continue;
+        hits.push({
+          patent_number: `${numMatch[1] ?? ''}${numMatch[2]}`,
+          label_matched: label,
+          found_in: {
+            document_id: filing.document_id,
+            entry_number: filing.entry_number,
+            date_filed: filing.date_filed,
+            description_excerpt: field.slice(0, 300),
+          },
+        });
+      }
+    }
+  }
+  return hits;
+}
+
+interface CaptionParties {
+  plaintiffs: string[];
+  defendants: string[];
+  plaintiffs_truncated: boolean;
+  defendants_truncated: boolean;
+}
+
+/**
+ * Split a case caption on " v. " / " vs. " into plaintiff(s) and
+ * defendant(s). This reads the caption CourtListener indexed from the docket
+ * header — not the PACER party table, which needs an authenticated detail
+ * call this pack does not make — so it answers "who is this case between",
+ * not a verified party list. "et al." on either side is reported as a
+ * truncation rather than silently dropped. Deliberately split on ";" and
+ * " and " only, NEVER a bare comma: a corporate suffix ("Co., Ltd", "Inc.,")
+ * routinely contains one, and splitting on it would cut a single defendant's
+ * name in two. The cost is real but conservative: several distinct
+ * defendants joined only by commas (no "and"/";") come back as one combined
+ * string rather than being wrongly split.
+ */
+function splitCaption(caseName: string): CaptionParties {
+  const sides = caseName.split(/\s+vs?\.?\s+/i);
+  const side = (s: string | undefined): { names: string[]; truncated: boolean } => {
+    if (!s) return { names: [], truncated: false };
+    const truncated = /\bet\s*al\.?\b/i.test(s);
+    const stripped = s.replace(/,?\s*et\s*al\.?/gi, '').trim();
+    const names = stripped
+      .split(/\s*;\s*|\s+and\s+/i)
+      .map((n) => n.trim())
+      .filter(Boolean);
+    return { names, truncated };
+  };
+  const p = side(sides[0]);
+  const d = side(sides[1]);
+  return {
+    plaintiffs: p.names,
+    defendants: d.names,
+    plaintiffs_truncated: p.truncated,
+    defendants_truncated: d.truncated,
+  };
+}
+
+// ── USPTO Open Data Portal — minimal patent-metadata lookup ────────────
+//
+// Deliberately a SEPARATE, minimal client from the `patents` pack (packs
+// compound packs inherit nothing). This fetches only what a litigation
+// cross-reference needs: title, status, dates, inventor/applicant.
+
+interface UsptoApplicationMetaData {
+  inventionTitle?: string;
+  filingDate?: string;
+  grantDate?: string;
+  applicationStatusDescriptionText?: string;
+  firstInventorName?: string;
+  firstApplicantName?: string;
+}
+
+interface UsptoOdpRecord {
+  applicationNumberText?: string;
+  applicationMetaData?: UsptoApplicationMetaData;
+}
+
+interface UsptoOdpSearchResponse {
+  count?: number;
+  patentFileWrapperDataBag?: UsptoOdpRecord[];
+}
+
+const USPTO_ODP_BASE = 'https://api.uspto.gov/api/v1/patent';
+
+async function usptoPatentLookup(apiKey: string, patentNumberDigitsOnly: string): Promise<UsptoOdpRecord | undefined> {
+  const url = new URL(`${USPTO_ODP_BASE}/applications/search`);
+  url.searchParams.set('q', `applicationMetaData.patentNumber:${patentNumberDigitsOnly}`);
+  url.searchParams.set('size', '1');
+  const res = await pwFetch(url.toString(), { headers: { 'X-Api-Key': apiKey, Accept: 'application/json' } });
+  if (res.status === 401 || res.status === 403) {
+    throw new Error('USPTO ODP rejected the API key.');
+  }
+  if (res.status === 429) {
+    throw new Error('USPTO ODP rate limit hit (429). Default tier is 60 req/min.');
+  }
+  if (res.status === 404) {
+    const text = await res.text().catch(() => '');
+    if (/no matching records/i.test(text)) return undefined;
+    throw new Error(`USPTO ODP error 404: ${summarizeErrorBody(text)}`);
+  }
+  if (!res.ok) throw await httpError(res, 'USPTO ODP');
+  const data = await parseJson<UsptoOdpSearchResponse>(res, 'USPTO ODP');
+  return data.patentFileWrapperDataBag?.[0];
+}
+
+function formatUsptoMeta(r: UsptoOdpRecord) {
+  const meta = r.applicationMetaData ?? {};
+  return {
+    title: meta.inventionTitle ?? null,
+    status: meta.applicationStatusDescriptionText ?? null,
+    filing_date: meta.filingDate ?? null,
+    grant_date: meta.grantDate ?? null,
+    first_inventor: meta.firstInventorName ?? null,
+    first_applicant: meta.firstApplicantName ?? null,
+    application_number: r.applicationNumberText ?? null,
+  };
+}
+
+async function findCasePatents(args: Record<string, unknown>) {
+  const docketIdArg = args.docket_id != null && args.docket_id !== '' ? Number(args.docket_id) : null;
+  const caseName = typeof args.case_name === 'string' ? args.case_name.trim() : '';
+  if (!docketIdArg && !caseName) {
+    throw new Error('Pass either "docket_id" (from search_dockets) or "case_name" (e.g. "TurboCode LLC v. Quectel Wireless Solutions").');
+  }
+  const court = typeof args.court === 'string' && args.court.trim() ? args.court.trim() : undefined;
+
+  const params = new URLSearchParams({
+    q: docketIdArg ? `docket_id:${docketIdArg}` : caseName,
+    type: 'r',
+    order_by: 'score desc',
+  });
+  if (court) params.set('court', court);
+
+  const { rows } = await searchPaged(params, 5);
+  if (rows.length === 0) {
+    return {
+      found: false,
+      reason: 'no_docket_matched',
+      query: docketIdArg ? { docket_id: docketIdArg } : { case_name: caseName, court: court ?? null },
+      hint: 'No CourtListener docket matched. Confirm the case name spelling (e.g. "TurboCode LLC v. Quectel Wireless Solutions"), or look it up first with search_dockets.',
+    };
+  }
+  if (rows.length > 1 && !docketIdArg) {
+    return {
+      found: false,
+      reason: 'ambiguous_case_name',
+      query: { case_name: caseName, court: court ?? null },
+      candidates: rows.slice(0, 5).map(formatDocketResult),
+      hint: 'More than one docket matched this name. Call again with docket_id set to the one you mean.',
+    };
+  }
+  const docket = formatDocketResult(rows[0]);
+  const docketId = Number(docket.docket_id);
+
+  const filingLimit = Math.min(100, Math.max(1, Number(args.filing_limit) || 50));
+  const filingsResult = (await listDocketFilings(docketId, filingLimit)) as
+    | { found: true; filings: ProjectedFiling[] }
+    | { found: false; reason: string; hint: string };
+  const filings = filingsResult.found ? filingsResult.filings : [];
+
+  const hitsByNumber = new Map<string, AssertedPatentHit & { mentioned_in_filings: number }>();
+  for (const f of filings) {
+    for (const hit of extractAssertedPatents(f)) {
+      const key = hit.patent_number.replace(/,/g, '').toUpperCase();
+      const existing = hitsByNumber.get(key);
+      if (existing) existing.mentioned_in_filings += 1;
+      else hitsByNumber.set(key, { ...hit, mentioned_in_filings: 1 });
+    }
+  }
+
+  const apiKey = (args._apiKey as string | undefined)?.trim() || undefined;
+  const assertedPatents = await Promise.all(
+    Array.from(hitsByNumber.values()).map(async (hit) => {
+      if (!apiKey) {
+        return { ...hit, metadata: null, metadata_unavailable_reason: 'USPTO Open Data Portal key not configured for this call.' };
+      }
+      try {
+        const clean = hit.patent_number.replace(/,/g, '').replace(/^(RE|D)/, '');
+        const record = await usptoPatentLookup(apiKey, clean);
+        if (!record) {
+          return {
+            ...hit,
+            metadata: null,
+            metadata_unavailable_reason: 'No USPTO Open Data Portal record found for this number — confirm it is a granted US patent number, not a publication or application number.',
+          };
+        }
+        return { ...hit, metadata: formatUsptoMeta(record) };
+      } catch (err) {
+        return { ...hit, metadata: null, metadata_unavailable_reason: err instanceof Error ? err.message : String(err) };
+      }
+    }),
+  );
+
+  const parties = splitCaption(String(docket.caseName ?? ''));
+  const defendants = parties.defendants.map((name) => ({
+    name,
+    source: 'case_caption' as const,
+    corroborated_by_filing: filings.some((f) => (f.description ?? '').toLowerCase().includes(name.toLowerCase())),
+  }));
+
+  return {
+    found: true,
+    docket,
+    plaintiffs: parties.plaintiffs,
+    plaintiffs_truncated: parties.plaintiffs_truncated,
+    defendants_count: defendants.length,
+    defendants,
+    defendants_truncated: parties.defendants_truncated,
+    filings_scanned: filings.length,
+    asserted_patents_count: assertedPatents.length,
+    asserted_patents: assertedPatents,
+    ...(assertedPatents.length === 0
+      ? {
+          reason: 'no_patents_labeled_in_scanned_filings',
+          hint: `Scanned ${filings.length} docket filing(s) for text explicitly labeled "Patent No./Patent Nos./Patent Number" and found none. The complaint or an exhibit may still name the asserted patent(s) inside a PACER document RECAP has not indexed text for — get_docket_filing / list_docket_filings shows which filings have pdf_available.`,
+        }
+      : {}),
+    caveats: [
+      'Thin cross-reference: no PACER documents were purchased. Patent numbers come only from text RECAP already indexes — the clerk\'s own docket-entry descriptions, and the text excerpt of any document someone else has already purchased from PACER.',
+      'Defendants are read from the case caption CourtListener indexed, not an authenticated PACER party table. Several distinct defendants joined only by commas (no "and"/";") may appear here as one combined name.',
+      ...(parties.defendants_truncated
+        ? ['The case caption includes "et al." — there may be additional, unnamed defendants beyond the ones listed here.']
+        : []),
+    ],
+    source: 'Free Law Project (CourtListener/RECAP docket and filings); U.S. Patent and Trademark Office (Open Data Portal patent metadata).',
   };
 }
 
