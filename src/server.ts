@@ -10,7 +10,7 @@ import pack from './index.js';
 
 
 const server = new Server(
-  { name: '@pipeworx/mcp-court-listener', version: '0.1.8' },
+  { name: '@pipeworx/mcp-court-listener', version: '0.1.9' },
   { capabilities: { tools: {} } },
 );
 
