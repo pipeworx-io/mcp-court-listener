@@ -1,12 +1,20 @@
 {
   "name": "@pipeworx/mcp-court-listener",
-  "version": "0.1.9",
+  "version": "0.2.0",
   "description": "CourtListener MCP — Free Law Project's CourtListener API (v4).",
   "type": "module",
-  "main": "src/index.ts",
-  "types": "src/index.ts",
+  "main": "lib/index.js",
+  "exports": {
+    ".": "./lib/index.js",
+    "./tools.json": "./tools.json",
+    "./package.json": "./package.json"
+  },
   "bin": {
     "mcp-court-listener": "bin/cli.js"
+  },
+  "files": ["bin/", "lib/", "tools.json", "server.json"],
+  "engines": {
+    "node": ">=18"
   },
   "keywords": ["mcp", "mcp-server", "model-context-protocol", "pipeworx", "court-listener"],
   "license": "MIT",
@@ -14,19 +22,12 @@
     "type": "git",
     "url": "git+https://github.com/pipeworx-io/mcp-court-listener.git"
   },
-  "scripts": {
-    "typecheck": "tsc --noEmit"
-  },
-  "dependencies": {
-    "@modelcontextprotocol/sdk": "^1.30.0",
-    "tsx": "^4.19.0"
-  },
-  "devDependencies": {
-    "typescript": "^5.9.3",
-    "@cloudflare/workers-types": "^4.20260405.1"
-  },
+  "mcpName": "io.github.pipeworx-io/court-listener",
   "pipeworx": {
-    "sourceHash": "v1-8c84187e935c8025b168bd331bd3314b59a13df0d40c7d05c4ad389616cc8835",
-    "sourceCommit": "f1ef7a2f6b9cb1b8da1374ec2fcb28c661582b35"
+    "mode": "gateway",
+    "slug": "court-listener",
+    "gatewaySlug": "court-listener",
+    "sourceHash": "v1-bf446f92db34b542c001abf795ef32fa6cccc0e5a7750b0e63a39a6e8a1faf42",
+    "sourceCommit": "4277282d72f9bf55e548b3799aaf737baf22152f"
   }
 }
