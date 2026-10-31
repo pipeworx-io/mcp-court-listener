@@ -1,6 +1,6 @@
 {
   "name": "@pipeworx/mcp-court-listener",
-  "version": "0.2.0",
+  "version": "0.2.1",
   "description": "CourtListener MCP — Free Law Project's CourtListener API (v4).",
   "type": "module",
   "main": "lib/index.js",
@@ -27,7 +27,7 @@
     "mode": "gateway",
     "slug": "court-listener",
     "gatewaySlug": "court-listener",
-    "sourceHash": "v1-bf446f92db34b542c001abf795ef32fa6cccc0e5a7750b0e63a39a6e8a1faf42",
-    "sourceCommit": "4277282d72f9bf55e548b3799aaf737baf22152f"
+    "sourceHash": "v1-daa9c21afd4ef03f9bd56030fbd306432481f8effd7c82cb2049634a1857e880",
+    "sourceCommit": "8cc978183948532674e797c429305c9d8ab2a1c3"
   }
 }
